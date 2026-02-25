@@ -2,7 +2,8 @@
 # ===========================================
 # Streamlit-приложение:
 # - Собирает отзывы App Store (Apple RSS JSON) по всем странам
-# - Фильтрует по дате (последние N дней) и языку (только RU)
+# - Фильтрует по дате (последние N дней)
+# - Оставляет только русскоязычные отзывы (эвристика по доле кириллицы, без langdetect)
 # - Делает авто-тэгирование тем (rule-based)
 # - Даёт скачать CSV из интерфейса
 #
@@ -22,9 +23,7 @@ import requests
 import pandas as pd
 import streamlit as st
 from dateutil.relativedelta import relativedelta
-from langdetect import detect, DetectorFactory, LangDetectException
 
-DetectorFactory.seed = 42  # фиксируем seed для более повторяемого langdetect
 
 # -----------------------------
 # Расширенный список storefront/country кодов (ISO 3166-1 alpha-2)
@@ -55,12 +54,14 @@ STORE_FRONTS = [
     "za",
 ]
 
+
 # -----------------------------
-# Утилита: логирование в Streamlit
+# Логирование в Streamlit
 # -----------------------------
 def ui_log(log_box: st.delta_generator.DeltaGenerator, msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
     log_box.write(f"[{ts}] {msg}")
+
 
 # -----------------------------
 # Надёжные HTTP-запросы: retry + экспоненциальная пауза
@@ -96,6 +97,7 @@ def request_with_retry(
 
     return None
 
+
 # -----------------------------
 # Извлечение app_id и дефолтной страны из URL
 # -----------------------------
@@ -108,6 +110,7 @@ def extract_app_id(app_url: str) -> str:
 def extract_default_country_from_url(app_url: str) -> str:
     m = re.search(r"apps\.apple\.com/([a-z]{2})/", app_url.lower())
     return m.group(1) if m else "us"
+
 
 # -----------------------------
 # iTunes Lookup: проверка доступности приложения в стране + app_name
@@ -132,6 +135,7 @@ def get_app_name(session: requests.Session, app_id: str, preferred_country: str)
         if data and data.get("results"):
             return data["results"][0].get("trackName")
     return None
+
 
 # -----------------------------
 # Apple RSS JSON endpoint: customerreviews
@@ -184,20 +188,31 @@ def parse_iso_date(date_str: str) -> datetime | None:
     except Exception:
         return None
 
+
 # -----------------------------
-# Определение языка (нужен фильтр ru)
+# RU-фильтр без langdetect:
+# считаем долю кириллицы среди букв и порогом решаем "русский / не русский"
 # -----------------------------
-def detect_language(text: str) -> str:
-    text = (text or "").strip()
-    if len(text) < 12:
-        return "unknown"
-    try:
-        lang = detect(text)
-        return lang if lang else "unknown"
-    except LangDetectException:
-        return "unknown"
-    except Exception:
-        return "unknown"
+_CYR_RE = re.compile(r"[А-Яа-яЁё]")
+_LETTER_RE = re.compile(r"[A-Za-zА-Яа-яЁё]")
+
+def ru_score(text: str) -> float:
+    # Возвращает долю кириллицы среди всех букв (0..1)
+    t = (text or "").strip()
+    if not t:
+        return 0.0
+    letters = _LETTER_RE.findall(t)
+    if len(letters) < 12:
+        # очень короткий текст не считаем надёжным
+        return 0.0
+    cyr = _CYR_RE.findall(t)
+    return len(cyr) / max(len(letters), 1)
+
+def is_russian_text(title: str, body: str, threshold: float = 0.55) -> bool:
+    # Склеиваем title + body и проверяем долю кириллицы
+    combined = f"{title or ''} {body or ''}".strip()
+    return ru_score(combined) >= threshold
+
 
 # -----------------------------
 # Дедуп: review_id или fallback hash
@@ -210,6 +225,7 @@ def normalized_text_for_hash(text: str) -> str:
 def make_fallback_dedupe_key(author_name: str, review_date_iso: str, text: str) -> str:
     base = f"{author_name}||{review_date_iso}||{normalized_text_for_hash(text)}"
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
 
 # -----------------------------
 # Авто-тэгирование тем (rule-based)
@@ -332,6 +348,7 @@ def tag_topics(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+
 # -----------------------------
 # Главная функция: сбор + RU-only + тэгирование
 # -----------------------------
@@ -339,7 +356,7 @@ def scrape_appstore_reviews_all_countries(
     app_url: str,
     per_country_limit: int = 50,
     days: int = 7,
-    only_language: str = "ru",
+    ru_threshold: float = 0.55,
     delay_between_requests_min: float = 0.25,
     delay_between_requests_max: float = 0.55,
     log_box=None,
@@ -361,6 +378,7 @@ def scrape_appstore_reviews_all_countries(
     if log_box:
         ui_log(log_box, f"app_id={app_id}, default_country={default_country}, app_name={app_name}")
         ui_log(log_box, f"Cutoff (UTC) = {cutoff.isoformat()} (последние {days} дней)")
+        ui_log(log_box, f"RU-фильтр: доля кириллицы ≥ {ru_threshold:.2f}")
 
     all_rows = []
     seen_review_ids = set()
@@ -373,7 +391,6 @@ def scrape_appstore_reviews_all_countries(
         if progress_callback:
             progress_callback((idx + 1) / total_countries, country)
 
-        # Валидация страны: если приложение недоступно — пропускаем
         lookup = itunes_lookup(session, app_id, country)
         if not lookup:
             if log_box:
@@ -382,7 +399,7 @@ def scrape_appstore_reviews_all_countries(
 
         pages = 0
         scanned = 0
-        kept_lang = 0
+        kept_ru = 0
         filtered_old = 0
         stop_due_to_old = False
         page = 1
@@ -414,7 +431,6 @@ def scrape_appstore_reviews_all_countries(
                     ui_log(log_box, f"[{country}] page={page}: отзывов нет -> стоп по стране")
                 break
 
-            # Отзывы обычно идут от новых к старым — как только увидели старые, можем завершать
             for rv in reviews:
                 if scanned >= per_country_limit:
                     break
@@ -450,12 +466,11 @@ def scrape_appstore_reviews_all_countries(
                 if review_id:
                     seen_review_ids.add(review_id)
 
-                # Фильтр по языку: оставляем только ru
-                lang = detect_language(f"{title}\n{text}")
-                if lang != only_language:
+                # RU-only фильтр по доле кириллицы
+                if not is_russian_text(title, text, threshold=ru_threshold):
                     continue
 
-                kept_lang += 1
+                kept_ru += 1
                 all_rows.append({
                     "app_id": app_id,
                     "app_name": app_name,
@@ -467,20 +482,20 @@ def scrape_appstore_reviews_all_countries(
                     "review_text": text,
                     "review_date": review_date_iso,
                     "version": version,
-                    "language": lang,
+                    "language": "ru",
                     "source_url": app_url,
                 })
 
             if log_box:
                 ui_log(
                     log_box,
-                    f"[{country}] pages={pages}, scanned={scanned}/{per_country_limit}, kept_{only_language}={kept_lang}, filtered_old={filtered_old} (page={page})"
+                    f"[{country}] pages={pages}, scanned={scanned}/{per_country_limit}, kept_ru={kept_ru}, filtered_old={filtered_old} (page={page})"
                 )
 
             page += 1
 
         if log_box:
-            ui_log(log_box, f"[{country}] DONE: pages={pages}, scanned={scanned}, kept_{only_language}={kept_lang}")
+            ui_log(log_box, f"[{country}] DONE: pages={pages}, scanned={scanned}, kept_ru={kept_ru}")
 
     df = pd.DataFrame(all_rows)
 
@@ -533,7 +548,7 @@ def scrape_appstore_reviews_all_countries(
 st.set_page_config(page_title="App Store Reviews (RU) + Topic Tags", layout="wide")
 
 st.title("App Store отзывы (все страны) → только RU → тэгирование тем")
-st.caption("Источник: Apple RSS JSON (customerreviews) + iTunes Lookup. Без Selenium/Playwright.")
+st.caption("Источник: Apple RSS JSON (customerreviews) + iTunes Lookup. Без Selenium/Playwright. Без langdetect.")
 
 with st.sidebar:
     st.header("Параметры")
@@ -543,7 +558,7 @@ with st.sidebar:
     )
     per_country_limit = st.slider("Лимит на страну (сколько просматриваем)", 5, 50, 50, 5)
     days = st.slider("Период (дней назад)", 1, 30, 7, 1)
-    only_language = st.selectbox("Оставлять язык", options=["ru"], index=0)
+    ru_threshold = st.slider("RU-порог (доля кириллицы)", 0.30, 0.90, 0.55, 0.05)
 
     st.divider()
     st.write("Скорость (чтобы меньше ловить 429):")
@@ -568,7 +583,7 @@ if run_btn:
             app_url=app_url,
             per_country_limit=per_country_limit,
             days=days,
-            only_language=only_language,
+            ru_threshold=ru_threshold,
             delay_between_requests_min=delay_min,
             delay_between_requests_max=delay_max,
             log_box=log_box,
@@ -604,7 +619,7 @@ if run_btn:
             else:
                 st.write("Недостаточно данных для расчёта.")
 
-        # Кнопка скачивания CSV
+        # Скачать CSV
         out_name = f"appstore_reviews_all_countries_{extract_app_id(app_url)}_{datetime.now().strftime('%Y%m%d')}.csv"
         csv_bytes = df.to_csv(index=False, encoding="utf-8", quoting=csv.QUOTE_ALL).encode("utf-8")
 
