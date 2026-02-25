@@ -1,10 +1,11 @@
 # app.py
 # ===========================================
-# Streamlit-приложение (упрощённый UI):
+# Streamlit-приложение (упрощённый UI + панель параметров):
 # - Сбор отзывов App Store (Apple RSS JSON) по всем странам
 # - Фильтр: последние N дней + только RU (эвристика по доле кириллицы)
-# - Тэгирование тем сохраняется в данных/CSV (но НЕ показываем отдельные сводки на экране)
-# - Показываем только: кнопку запуска, прогресс, итоговую таблицу, скачать CSV
+# - Тэгирование тем сохраняется в данных/CSV
+# - UI: заголовок, панель параметров, кнопка запуска, прогресс, результат + таблица, скачать CSV
+# - ЛОГ полностью убран
 # ===========================================
 
 import re
@@ -48,14 +49,6 @@ STORE_FRONTS = [
     "vc","ve","vg","vn",
     "za",
 ]
-
-
-# -----------------------------
-# Логирование (в UI не показываем лишнее — лог оставим компактным)
-# -----------------------------
-def ui_log(log_box, msg: str):
-    ts = datetime.now().strftime("%H:%M:%S")
-    log_box.write(f"[{ts}] {msg}")
 
 
 # -----------------------------
@@ -339,7 +332,6 @@ def scrape_appstore_reviews_all_countries(
     ru_threshold: float = 0.55,
     delay_between_requests_min: float = 0.25,
     delay_between_requests_max: float = 0.55,
-    log_box=None,
     progress_callback=None,
 ):
     app_id = extract_app_id(app_url)
@@ -354,9 +346,6 @@ def scrape_appstore_reviews_all_countries(
     app_name = get_app_name(session, app_id, preferred_country=default_country)
     now_utc = datetime.now(timezone.utc)
     cutoff = now_utc - relativedelta(days=days)
-
-    if log_box:
-        ui_log(log_box, f"Сбор: app_id={app_id} | период={days}д | лимит={per_country_limit}/страна | RU-порог={ru_threshold:.2f}")
 
     all_rows = []
     seen_review_ids = set()
@@ -478,11 +467,10 @@ def scrape_appstore_reviews_all_countries(
 
 
 # ===========================================
-# UI (упрощённый)
+# UI
 # ===========================================
-st.set_page_config(page_title="App Store отзывы (RU)", layout="wide")
-
-st.title("App Store отзывы (все страны) → только RU → тэгирование тем")
+st.set_page_config(page_title="App Store отзывы", layout="wide")
+st.title("App Store отзывы")
 
 with st.sidebar:
     st.header("Параметры")
@@ -494,10 +482,14 @@ with st.sidebar:
     days = st.slider("Период (дней назад)", 1, 30, 7, 1)
     ru_threshold = st.slider("RU-порог (доля кириллицы)", 0.30, 0.90, 0.55, 0.05)
 
-run_btn = st.button("🚀 Запустить сбор")
+    st.divider()
+    st.write("Скорость (чтобы меньше ловить 429):")
+    delay_min = st.slider("Пауза min (сек)", 0.0, 2.0, 0.25, 0.05)
+    delay_max = st.slider("Пауза max (сек)", 0.0, 3.0, 0.55, 0.05)
+    if delay_max < delay_min:
+        st.warning("delay_max должен быть ≥ delay_min")
 
-# Лог оставляем, но компактный (можно вообще удалить, если хочешь ещё проще)
-log_box = st.empty()
+run_btn = st.button("🚀 Запустить сбор")
 
 progress_bar = st.progress(0, text="Ожидание запуска...")
 
@@ -511,7 +503,8 @@ if run_btn:
             per_country_limit=per_country_limit,
             days=days,
             ru_threshold=ru_threshold,
-            log_box=log_box,
+            delay_between_requests_min=delay_min,
+            delay_between_requests_max=delay_max,
             progress_callback=progress_cb,
         )
         progress_bar.progress(100, text="Готово ✅")
