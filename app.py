@@ -1,15 +1,10 @@
 # app.py
 # ===========================================
-# Streamlit-приложение:
-# - Собирает отзывы App Store (Apple RSS JSON) по всем странам
-# - Фильтрует по дате (последние N дней)
-# - Оставляет только русскоязычные отзывы (эвристика по доле кириллицы, без langdetect)
-# - Делает авто-тэгирование тем (rule-based)
-# - Даёт скачать CSV из интерфейса
-#
-# Запуск:
-#   pip install -r requirements.txt
-#   streamlit run app.py
+# Streamlit-приложение (упрощённый UI):
+# - Сбор отзывов App Store (Apple RSS JSON) по всем странам
+# - Фильтр: последние N дней + только RU (эвристика по доле кириллицы)
+# - Тэгирование тем сохраняется в данных/CSV (но НЕ показываем отдельные сводки на экране)
+# - Показываем только: кнопку запуска, прогресс, итоговую таблицу, скачать CSV
 # ===========================================
 
 import re
@@ -26,7 +21,7 @@ from dateutil.relativedelta import relativedelta
 
 
 # -----------------------------
-# Расширенный список storefront/country кодов (ISO 3166-1 alpha-2)
+# Список storefront/country кодов
 # -----------------------------
 STORE_FRONTS = [
     "ae","ag","ai","al","am","ao","ar","at","au","az",
@@ -56,9 +51,9 @@ STORE_FRONTS = [
 
 
 # -----------------------------
-# Логирование в Streamlit
+# Логирование (в UI не показываем лишнее — лог оставим компактным)
 # -----------------------------
-def ui_log(log_box: st.delta_generator.DeltaGenerator, msg: str):
+def ui_log(log_box, msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
     log_box.write(f"[{ts}] {msg}")
 
@@ -75,7 +70,6 @@ def request_with_retry(
     base_sleep: float = 0.75,
     jitter: float = 0.25,
 ):
-    # Повторяем запросы при 429/5xx и сетевых ошибках
     for attempt in range(max_retries):
         try:
             r = session.get(url, params=params, timeout=timeout)
@@ -129,7 +123,6 @@ def itunes_lookup(session: requests.Session, app_id: str, country: str) -> dict 
     return data
 
 def get_app_name(session: requests.Session, app_id: str, preferred_country: str) -> str | None:
-    # Сначала пробуем страну из URL, потом US как fallback
     for c in [preferred_country, "us"]:
         data = itunes_lookup(session, app_id, c)
         if data and data.get("results"):
@@ -144,7 +137,6 @@ def build_rss_url(country: str, app_id: str, page: int) -> str:
     return f"https://itunes.apple.com/{country}/rss/customerreviews/page={page}/id={app_id}/sortby=mostrecent/json"
 
 def parse_rss_reviews(feed_json: dict) -> list[dict]:
-    # Разбираем JSON в список отзывов
     feed = (feed_json or {}).get("feed", {})
     entries = feed.get("entry", [])
     if isinstance(entries, dict):
@@ -159,7 +151,6 @@ def parse_rss_reviews(feed_json: dict) -> list[dict]:
         updated = ((e.get("updated") or {}).get("label"))
         rid = ((e.get("id") or {}).get("label"))
 
-        # Если это не отзыв (служебная запись приложения) — пропускаем
         if not (author and content and title and rating and updated and rid):
             continue
 
@@ -176,8 +167,7 @@ def parse_rss_reviews(feed_json: dict) -> list[dict]:
         })
     return parsed
 
-def parse_iso_date(date_str: str) -> datetime | None:
-    # Приводим дату к UTC для корректного сравнения с cutoff
+def parse_iso_date(date_str: str):
     if not date_str:
         return None
     try:
@@ -190,26 +180,22 @@ def parse_iso_date(date_str: str) -> datetime | None:
 
 
 # -----------------------------
-# RU-фильтр без langdetect:
-# считаем долю кириллицы среди букв и порогом решаем "русский / не русский"
+# RU-фильтр без внешних библиотек
 # -----------------------------
 _CYR_RE = re.compile(r"[А-Яа-яЁё]")
 _LETTER_RE = re.compile(r"[A-Za-zА-Яа-яЁё]")
 
 def ru_score(text: str) -> float:
-    # Возвращает долю кириллицы среди всех букв (0..1)
     t = (text or "").strip()
     if not t:
         return 0.0
     letters = _LETTER_RE.findall(t)
     if len(letters) < 12:
-        # очень короткий текст не считаем надёжным
         return 0.0
     cyr = _CYR_RE.findall(t)
     return len(cyr) / max(len(letters), 1)
 
 def is_russian_text(title: str, body: str, threshold: float = 0.55) -> bool:
-    # Склеиваем title + body и проверяем долю кириллицы
     combined = f"{title or ''} {body or ''}".strip()
     return ru_score(combined) >= threshold
 
@@ -233,14 +219,12 @@ def make_fallback_dedupe_key(author_name: str, review_date_iso: str, text: str) 
 TOPIC_ORDER = ["onboarding", "streak", "ads", "subscription", "bugs", "motivation"]
 
 def _normalize_for_matching(text: str) -> str:
-    # Нормализация: lower + ё->е + удаление пунктуации + схлопывание пробелов
     t = (text or "").lower().replace("ё", "е")
     t = re.sub(r"[^\w\s]", " ", t, flags=re.UNICODE)
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
 def _compile_keyword_patterns():
-    # Словари ключевых слов/фраз по темам (EN + RU + ES + PT + FR + DE)
     kw = {
         "onboarding": [
             "onboarding","tutorial","getting started","first lesson","intro lesson","sign up","signup","log in","login","register","registration",
@@ -259,7 +243,6 @@ def _compile_keyword_patterns():
             "serie","tagesserie","serie einfrieren",
         ],
         "ads": [
-            # ad/ads — строго по границам слов, чтобы не ловить "advice"
             "ads","ad","advertising","advertisement","commercials","too many ads","banner ad","video ad","adblock",
             "реклама","баннер","ролик","видео реклама","слишком много рекламы","адблок","adblock",
             "anuncios","publicidad","demasiados anuncios",
@@ -268,7 +251,6 @@ def _compile_keyword_patterns():
             "werbung","anzeigen","zu viel werbung",
         ],
         "subscription": [
-            # Важно: "free trial" отдельно, не просто "free"
             "subscription","subscribe","premium","plus","super","payment","price","billing","trial","free trial","refund","cancel subscription",
             "подписка","подпис","оплат","платеж","цена","стоимост","пробный период","триал","возврат","отмена подписки",
             "suscripcion","suscrib","pago","precio","facturacion","prueba gratis","reembolso","cancelar suscripcion",
@@ -303,7 +285,6 @@ def _compile_keyword_patterns():
                 continue
 
             is_latin_single = bool(re.fullmatch(r"[a-z0-9]+", w_norm))
-
             if topic == "ads" and w_norm in ("ad", "ads"):
                 pat = re.compile(rf"\b{re.escape(w_norm)}\b", flags=re.IGNORECASE)
             elif is_latin_single:
@@ -320,7 +301,6 @@ def _compile_keyword_patterns():
 TOPIC_PATTERNS = _compile_keyword_patterns()
 
 def tag_topics(df: pd.DataFrame) -> pd.DataFrame:
-    # Добавляем topic_tags и булевые topic_*
     df = df.copy()
 
     def match_topics(title: str, text: str) -> dict:
@@ -350,7 +330,7 @@ def tag_topics(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # -----------------------------
-# Главная функция: сбор + RU-only + тэгирование
+# Основная логика сбора
 # -----------------------------
 def scrape_appstore_reviews_all_countries(
     app_url: str,
@@ -376,9 +356,7 @@ def scrape_appstore_reviews_all_countries(
     cutoff = now_utc - relativedelta(days=days)
 
     if log_box:
-        ui_log(log_box, f"app_id={app_id}, default_country={default_country}, app_name={app_name}")
-        ui_log(log_box, f"Cutoff (UTC) = {cutoff.isoformat()} (последние {days} дней)")
-        ui_log(log_box, f"RU-фильтр: доля кириллицы ≥ {ru_threshold:.2f}")
+        ui_log(log_box, f"Сбор: app_id={app_id} | период={days}д | лимит={per_country_limit}/страна | RU-порог={ru_threshold:.2f}")
 
     all_rows = []
     seen_review_ids = set()
@@ -393,42 +371,29 @@ def scrape_appstore_reviews_all_countries(
 
         lookup = itunes_lookup(session, app_id, country)
         if not lookup:
-            if log_box:
-                ui_log(log_box, f"[{country}] Приложение недоступно по lookup -> пропуск")
             continue
 
-        pages = 0
         scanned = 0
-        kept_ru = 0
-        filtered_old = 0
         stop_due_to_old = False
         page = 1
 
         time.sleep(random.uniform(delay_between_requests_min, delay_between_requests_max))
 
         while scanned < per_country_limit and not stop_due_to_old:
-            pages += 1
             rss_url = build_rss_url(country, app_id, page)
-
             r = request_with_retry(session, rss_url)
             time.sleep(random.uniform(delay_between_requests_min, delay_between_requests_max))
 
             if not r:
-                if log_box:
-                    ui_log(log_box, f"[{country}] page={page}: запрос не удался -> стоп по стране")
                 break
 
             try:
                 feed_json = r.json()
             except Exception:
-                if log_box:
-                    ui_log(log_box, f"[{country}] page={page}: не JSON -> стоп по стране")
                 break
 
             reviews = parse_rss_reviews(feed_json)
             if not reviews:
-                if log_box:
-                    ui_log(log_box, f"[{country}] page={page}: отзывов нет -> стоп по стране")
                 break
 
             for rv in reviews:
@@ -440,7 +405,6 @@ def scrape_appstore_reviews_all_countries(
                     continue
 
                 if dt < cutoff:
-                    filtered_old += 1
                     stop_due_to_old = True
                     break
 
@@ -452,7 +416,6 @@ def scrape_appstore_reviews_all_countries(
                 version = rv.get("version")
                 review_date_iso = dt.isoformat()
 
-                # Дедуп
                 if review_id:
                     if review_id in seen_review_ids:
                         continue
@@ -466,11 +429,9 @@ def scrape_appstore_reviews_all_countries(
                 if review_id:
                     seen_review_ids.add(review_id)
 
-                # RU-only фильтр по доле кириллицы
                 if not is_russian_text(title, text, threshold=ru_threshold):
                     continue
 
-                kept_ru += 1
                 all_rows.append({
                     "app_id": app_id,
                     "app_name": app_name,
@@ -486,20 +447,10 @@ def scrape_appstore_reviews_all_countries(
                     "source_url": app_url,
                 })
 
-            if log_box:
-                ui_log(
-                    log_box,
-                    f"[{country}] pages={pages}, scanned={scanned}/{per_country_limit}, kept_ru={kept_ru}, filtered_old={filtered_old} (page={page})"
-                )
-
             page += 1
-
-        if log_box:
-            ui_log(log_box, f"[{country}] DONE: pages={pages}, scanned={scanned}, kept_ru={kept_ru}")
 
     df = pd.DataFrame(all_rows)
 
-    # Гарантируем схему
     base_cols = [
         "app_id","app_name","country","review_id","author_name","rating",
         "title","review_text","review_date","version","language","source_url"
@@ -508,7 +459,6 @@ def scrape_appstore_reviews_all_countries(
         if c not in df.columns:
             df[c] = None
 
-    # Тэгирование
     if len(df) > 0:
         df = tag_topics(df)
     else:
@@ -516,26 +466,11 @@ def scrape_appstore_reviews_all_countries(
         for t in TOPIC_ORDER:
             df[f"topic_{t}"] = 0
 
-    # Финальный порядок колонок
     final_cols = [
-        "app_id",
-        "app_name",
-        "country",
-        "review_id",
-        "author_name",
-        "rating",
-        "title",
-        "review_text",
-        "review_date",
-        "version",
-        "language",
-        "topic_tags",
-        "topic_onboarding",
-        "topic_streak",
-        "topic_ads",
-        "topic_subscription",
-        "topic_bugs",
-        "topic_motivation",
+        "app_id","app_name","country","review_id","author_name","rating",
+        "title","review_text","review_date","version","language",
+        "topic_tags","topic_onboarding","topic_streak","topic_ads",
+        "topic_subscription","topic_bugs","topic_motivation",
         "source_url",
     ]
     df = df[final_cols]
@@ -543,12 +478,11 @@ def scrape_appstore_reviews_all_countries(
 
 
 # ===========================================
-# Streamlit UI
+# UI (упрощённый)
 # ===========================================
-st.set_page_config(page_title="App Store Reviews (RU) + Topic Tags", layout="wide")
+st.set_page_config(page_title="App Store отзывы (RU)", layout="wide")
 
 st.title("App Store отзывы (все страны) → только RU → тэгирование тем")
-st.caption("Источник: Apple RSS JSON (customerreviews) + iTunes Lookup. Без Selenium/Playwright. Без langdetect.")
 
 with st.sidebar:
     st.header("Параметры")
@@ -556,26 +490,19 @@ with st.sidebar:
         "App Store URL",
         value="https://apps.apple.com/us/app/duolingo-language-lessons/id570060128"
     )
-    per_country_limit = st.slider("Лимит на страну (сколько просматриваем)", 5, 50, 50, 5)
+    per_country_limit = st.slider("Лимит на страну", 5, 50, 50, 5)
     days = st.slider("Период (дней назад)", 1, 30, 7, 1)
     ru_threshold = st.slider("RU-порог (доля кириллицы)", 0.30, 0.90, 0.55, 0.05)
 
-    st.divider()
-    st.write("Скорость (чтобы меньше ловить 429):")
-    delay_min = st.slider("Пауза min (сек)", 0.0, 2.0, 0.25, 0.05)
-    delay_max = st.slider("Пауза max (сек)", 0.0, 3.0, 0.55, 0.05)
-    if delay_max < delay_min:
-        st.warning("delay_max должен быть ≥ delay_min")
-
 run_btn = st.button("🚀 Запустить сбор")
 
+# Лог оставляем, но компактный (можно вообще удалить, если хочешь ещё проще)
 log_box = st.empty()
+
 progress_bar = st.progress(0, text="Ожидание запуска...")
-country_badge = st.empty()
 
 def progress_cb(progress_value: float, country: str):
-    progress_bar.progress(int(progress_value * 100), text=f"Сканируем страны... ({country})")
-    country_badge.info(f"Текущая страна: {country}")
+    progress_bar.progress(int(progress_value * 100), text=f"Сбор... ({country})")
 
 if run_btn:
     try:
@@ -584,8 +511,6 @@ if run_btn:
             per_country_limit=per_country_limit,
             days=days,
             ru_threshold=ru_threshold,
-            delay_between_requests_min=delay_min,
-            delay_between_requests_max=delay_max,
             log_box=log_box,
             progress_callback=progress_cb,
         )
@@ -595,31 +520,6 @@ if run_btn:
         st.write(f"Собрано RU-отзывов: **{len(df)}**")
         st.dataframe(df, use_container_width=True)
 
-        # Сводка по темам
-        st.subheader("Сводка по темам")
-        if len(df) > 0:
-            exploded = df["topic_tags"].str.split(",", expand=False).explode()
-            exploded = exploded[exploded.notna() & (exploded != "")]
-            if len(exploded) > 0:
-                counts = exploded.value_counts().reindex(TOPIC_ORDER).fillna(0).astype(int)
-                st.write(counts)
-            else:
-                st.write("Совпадений по темам не найдено.")
-
-            st.subheader("Средний рейтинг по темам")
-            rows = []
-            for t in TOPIC_ORDER:
-                sub = df[df[f"topic_{t}"] == 1]
-                if len(sub) == 0:
-                    continue
-                avg = sub["rating"].dropna().astype(float).mean()
-                rows.append({"topic": t, "avg_rating": round(float(avg), 2), "n": len(sub)})
-            if rows:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True)
-            else:
-                st.write("Недостаточно данных для расчёта.")
-
-        # Скачать CSV
         out_name = f"appstore_reviews_all_countries_{extract_app_id(app_url)}_{datetime.now().strftime('%Y%m%d')}.csv"
         csv_bytes = df.to_csv(index=False, encoding="utf-8", quoting=csv.QUOTE_ALL).encode("utf-8")
 
